@@ -4,6 +4,189 @@
 """
 Adds all sector-coupling components to the network, including demand and supply
 technologies for the buildings, transport and industry sectors.
+
+Script: prepare_sector_network.py
+Purpose: Transform the electricity-only network into a fully sector-coupled
+         energy system model including heat, transport, industry, and gas/H2.
+         This is the LARGEST and most complex script in the PyPSA-Eur workflow.
+
+===============================================================================
+DATA FLOW OVERVIEW
+===============================================================================
+
+Input Files:
+    1. base electricity network: From prepare_network.py or cluster_network.py
+       - Transmission topology, existing generators
+
+    2. costs.csv: Technology cost database
+       - Capital costs, efficiencies, lifetimes for all technologies
+
+    3. Heat demand profiles:
+       - hourly_heat_demand_*.nc: Space and water heating
+       - district_heat_share.csv: District vs. individual heating
+
+    4. Transport demand:
+       - transport_demand.csv: Vehicle kilometers, energy per mode
+       - mobility_profiles.nc: Hourly transport profiles
+
+    5. Industry demand:
+       - industrial_energy_demand_per_node.csv: Energy by carrier per node
+
+    6. Gas/H2 infrastructure:
+       - gas_network.csv: Existing gas pipeline topology
+       - h2_network.csv: Hydrogen infrastructure (if any)
+
+    7. Biomass potentials:
+       - biomass_potentials.csv: Available biomass by type and region
+
+Output:
+    - Fully sector-coupled network with:
+      * Heat sector (heat pumps, boilers, district heating)
+      * Transport (EVs, hydrogen vehicles, synthetic fuels)
+      * Industry (process heat, feedstocks)
+      * Gas network and H2 infrastructure
+      * Carbon capture and storage
+
+===============================================================================
+KEY SPATIAL CONFIGURATION
+===============================================================================
+
+The define_spatial() function (lines 52-223) sets up carrier-specific buses:
+
+1. BIOMASS: Node-specific or EU-wide single node
+2. CO2: Node-specific or EU-wide (for CCS infrastructure)
+3. GAS: Node-specific (with network) or EU-wide single node
+4. HYDROGEN: Always node-specific (H2 buses per node)
+5. OIL: EU-wide single node
+6. METHANOL: EU-wide production, regional demand
+
+⚠️ The spatial configuration significantly affects model results:
+- "EU-wide" = perfect transport within Europe (copperplate)
+- "Node-specific" = transport costs and constraints apply
+
+===============================================================================
+KEY ADDITIONS: HEAT SECTOR
+===============================================================================
+
+Heat is divided into three systems:
+1. Urban Central: District heating networks
+2. Urban Decentral: Individual heating in cities
+3. Rural: Individual heating in rural areas
+
+Technologies added:
+- Heat pumps (air, ground source)
+- Resistive heaters
+- Gas/oil/biomass boilers
+- Solar thermal
+- Combined heat and power (CHP)
+- Thermal energy storage (water tanks, pits)
+
+Heat demand comes from build_hourly_heat_demand.py:
+- Space heating: Temperature-dependent
+- Water heating: More constant year-round
+
+===============================================================================
+KEY ADDITIONS: TRANSPORT SECTOR
+===============================================================================
+
+Transport modes covered:
+1. Road: BEV, FCEV, ICE (oil, synthetic fuels)
+2. Rail: Electric, diesel
+3. Shipping: Oil, methanol, ammonia, hydrogen
+4. Aviation: Kerosene, synthetic fuels
+
+Key components:
+- EV batteries: Can provide vehicle-to-grid (V2G)
+- Charging infrastructure: Smart charging profiles
+- Fuel cell vehicles: H2 demand
+- Synthetic fuel production: Fischer-Tropsch, methanolization
+
+===============================================================================
+KEY ADDITIONS: INDUSTRY SECTOR
+===============================================================================
+
+Industrial energy demand by type:
+1. Process heat (low, medium, high temperature)
+2. Electricity
+3. Feedstocks (hydrogen, methanol, naphtha)
+4. Carbon capture from processes
+
+Technologies:
+- Industrial heat pumps
+- Direct electric heating
+- Hydrogen for high-temp heat
+- Carbon capture (pre/post-combustion)
+
+===============================================================================
+KEY ADDITIONS: GAS AND HYDROGEN
+===============================================================================
+
+Gas Network:
+- Existing pipelines (if gas_network enabled)
+- LNG import terminals
+- Biogas upgrading
+- Synthetic methane from H2
+
+Hydrogen:
+- Electrolysis (various technologies)
+- Steam methane reforming (with/without CCS)
+- H2 pipelines (new or retrofitted from gas)
+- H2 storage (underground caverns)
+
+===============================================================================
+KEY ADDITIONS: CARBON MANAGEMENT
+===============================================================================
+
+Carbon flows:
+1. Capture from point sources (power, industry)
+2. Direct air capture (DAC)
+3. Transport (CO2 pipelines)
+4. Storage (geological sequestration)
+5. Usage (synthetic fuels)
+
+The CO2 network connects:
+- Emitters (fossil power plants, cement)
+- Capture plants
+- Storage sites
+
+===============================================================================
+COST CALCULATION
+===============================================================================
+
+The update_wind_solar_costs() function updates renewable costs:
+
+    capital_cost = base_cost + station_cost + connection_cost
+
+Where connection_cost depends on average_distance from build_renewable_profiles.py.
+
+===============================================================================
+CRITICAL: SPATIAL NAMESPACE
+===============================================================================
+
+The `spatial` SimpleNamespace object stores bus naming conventions:
+
+    spatial.gas.nodes = ["DE1 gas", "DE2 gas", ...] or ["EU gas"]
+    spatial.h2.nodes = ["DE1 H2", "DE2 H2", ...]
+
+This determines how carrier buses are named and connected.
+
+===============================================================================
+DEBUGGING TIPS
+===============================================================================
+
+Issue: "Missing bus" errors
+Cause: spatial configuration mismatch
+Check: Verify spatial.*.nodes match expected pattern
+
+Issue: "Demand not met"
+Cause: Missing carrier or technology
+Check: Ensure all required carriers are in network
+
+Issue: "Infeasible heat sector"
+Cause: Insufficient heating capacity or efficiency mismatch
+Check: Heat pump COPs, boiler efficiencies
+
+===============================================================================
 """
 
 import logging

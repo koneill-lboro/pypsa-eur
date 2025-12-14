@@ -8,6 +8,185 @@ generation time series (based on weather data), and (iii) the average distance
 from the node for onshore wind, AC-connected offshore wind, DC-connected
 offshore wind and solar PV generators.
 
+Script: build_renewable_profiles.py
+Purpose: Generate the technical potential (p_nom_max) and hourly capacity
+         factor profiles for renewable generators. This is the SOURCE of the
+         data used in add_existing_baseyear.py for capacity distribution.
+
+===============================================================================
+DATA FLOW OVERVIEW
+===============================================================================
+
+Input Files:
+    1. cutout (NetCDF via atlite): Weather data cutout
+       - Variables: wind speed, solar irradiance, temperature
+       - Resolution: Typically 0.3° × 0.3° grid (~30km)
+       - Source: ERA5 reanalysis or other weather datasets
+       - Time: Hourly data for simulation year(s)
+
+    2. availability_matrix (NetCDF): Land availability per grid cell
+       - Built by: determine_availability_matrix.py
+       - Values: 0-1 fraction of cell available for technology
+       - Accounts for: protected areas, settlements, slopes, etc.
+
+    3. distance_regions (GeoPackage): Region geometries
+       - For onshore: Regions are clustered bus zones
+       - For offshore: Exclusive Economic Zones (EEZ)
+
+    4. resource_regions (GeoPackage): Regions for resource class calculation
+
+Output Files:
+    - profile_{technology}.nc with structure:
+      * profile: (year, bus, bin, time) - hourly capacity factors [0-1]
+      * p_nom_max: (bus, bin) - installable capacity in MW
+      * average_distance: (bus, bin) - distance to grid/shore in km
+
+    - class_regions (GeoPackage): Geometry of resource class zones
+
+===============================================================================
+CRITICAL CALCULATION: INSTALLABLE CAPACITY (p_nom_max)
+===============================================================================
+
+The p_nom_max determines how much renewable capacity CAN BE installed at
+each bus. This is used in:
+- add_existing_baseyear.py for distributing existing capacity
+- solve_network.py as upper bound for new capacity
+
+FORMULA (line 285):
+    p_nom_max = capacity_per_sqkm × availability × area
+
+Where:
+    - capacity_per_sqkm: From config (e.g., 5 MW/km² for solar utility)
+    - availability: Fraction of land available (0-1)
+    - area: Grid cell area in km²
+
+⚠️ CRITICAL: This creates the TECHNICAL POTENTIAL that constrains all
+subsequent capacity calculations. If p_nom_max is too low:
+- Existing capacity distribution may exceed potential
+- New investment options are artificially constrained
+
+===============================================================================
+CRITICAL CALCULATION: CAPACITY FACTOR PROFILES
+===============================================================================
+
+Capacity factor represents hourly generation per unit of installed capacity.
+
+CALCULATION FLOW:
+
+1. Weather Data → Raw Capacity Factor (line 184):
+   func = getattr(cutout, resource.pop("method"))
+   capacity_factor = correction_factor * func(capacity_factor=True, **resource)
+
+   Where 'method' is typically:
+   - 'pv': Solar irradiance → DC output using panel model
+   - 'wind': Wind speed → power output using power curve
+
+2. Layout Weighting (line 247):
+   layout = capacity_factor * area * capacity_per_sqkm
+
+   This determines how much capacity goes in each grid cell.
+   MORE CAPACITY placed where capacity factor is HIGHER.
+
+   ⚠️ This is the assumption that creates the capacity-factor-weighted
+   distribution used in add_existing_baseyear.py
+
+3. Aggregated Profile (lines 262-269):
+   profile = func(matrix=matrix, layout=layout, per_unit=True, ...)
+
+   The profile is capacity-weighted average of grid cell capacity factors
+   within each region.
+
+===============================================================================
+CRITICAL CALCULATION: RESOURCE CLASSES (BINS)
+===============================================================================
+
+Resource classes divide capacity within each region by quality.
+
+PURPOSE:
+- Allows modeling of resource heterogeneity
+- Better sites (higher CF) can be used first
+- More accurate total system costs
+
+CALCULATION (lines 211-217):
+1. Compute capacity factor for each grid cell within region
+2. Define bins based on CF range: bins = linspace(cf_min, cf_max, nbins+1)
+3. Assign each cell to a bin based on its CF
+4. Create separate p_nom_max and profile for each bin
+
+EXAMPLE with nbins=3:
+- Bin 0: Low CF cells (e.g., 0.10-0.15 for solar)
+- Bin 1: Medium CF cells (e.g., 0.15-0.20 for solar)
+- Bin 2: High CF cells (e.g., 0.20-0.25 for solar)
+
+===============================================================================
+CRITICAL CALCULATION: AVERAGE DISTANCE
+===============================================================================
+
+Distance affects grid connection costs for offshore wind.
+
+CALCULATION (lines 294-302):
+For each (bus, bin):
+    distance = weighted_avg(grid_cell_distance, weight=layout)
+
+Where:
+- Onshore: Distance from cell to bus representative point
+- Offshore: Distance from cell to shoreline
+
+Used in prepare_sector_network.py to calculate:
+    connection_cost = distance × cable_cost_per_km
+
+===============================================================================
+KEY PARAMETERS FROM CONFIG
+===============================================================================
+
+Located in config['renewable'][technology]:
+
+1. capacity_per_sqkm:
+   - Solar utility: ~5 MW/km² (ground-mounted)
+   - Onshore wind: ~3-8 MW/km² (depending on turbine)
+   - Offshore wind: ~3-10 MW/km²
+
+2. correction_factor:
+   - Multiplier for capacity factors (default 1.0)
+   - Can account for technology improvements
+
+3. resource_classes (nbins):
+   - Number of quality bins (default 1)
+   - More bins = more accurate but larger model
+
+4. min_p_max_pu:
+   - Minimum average CF to include region
+   - Filters out very poor resource locations
+
+5. clip_p_max_pu:
+   - Minimum instantaneous CF to keep
+   - Values below this set to 0
+
+===============================================================================
+DATA PROVENANCE FOR DEBUGGING
+===============================================================================
+
+To trace where p_nom_max comes from:
+1. Check availability_matrix.nc - is land available?
+2. Check cutout - are coordinates correct?
+3. Check capacity_per_sqkm in config
+
+To trace where profile (CF) comes from:
+1. Check cutout weather data
+2. Check resource parameters (turbine/panel model)
+3. Check correction_factor
+
+===============================================================================
+INTERACTION WITH OTHER SCRIPTS
+===============================================================================
+
+This script provides data for:
+- add_electricity.py: Creates generators with p_nom_max from profiles
+- add_existing_baseyear.py: Distributes existing capacity using p_nom_max
+- prepare_sector_network.py: Updates costs based on average_distance
+
+===============================================================================
+
 .. note:: Hydroelectric profiles are built in script :mod:`build_hydro_profiles`.
 
 Outputs

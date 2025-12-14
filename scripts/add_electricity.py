@@ -6,6 +6,179 @@
 Adds existing electrical generators, hydro-electric plants as well as
 greenfield and battery and hydrogen storage to the clustered network.
 
+Script: add_electricity.py
+Purpose: Build the electricity-only network by combining topology, generators,
+         loads, and storage. This creates the BASE network before sector coupling.
+
+===============================================================================
+DATA FLOW OVERVIEW
+===============================================================================
+
+Input Files:
+    1. base_network.nc: Transmission topology from cluster_network.py
+       - Buses with locations and voltage levels
+       - Lines with s_nom (thermal limits)
+       - Links for DC connections
+
+    2. powerplants.csv: Power plant database
+       - Built by build_powerplants.py from OPSD/powerplantmatching
+       - Contains existing conventional plants with capacity, type, location
+
+    3. profile_{technology}.nc: Renewable profiles from build_renewable_profiles.py
+       - hourly capacity factors per bus
+       - p_nom_max (technical potential) per bus
+       - average_distance for connection costs
+
+    4. load.csv: Electricity demand time series
+       - Built by build_electricity_demand.py
+       - Hourly demand per bus (MW)
+
+    5. costs.csv: Technology cost assumptions
+       - capital_cost, marginal_cost, efficiency, lifetime
+       - From technology database
+
+    6. hydro_capacities.csv: Hydroelectric capacity by country
+
+Output:
+    - networks/base_s_{clusters}_elec.nc containing:
+      * Existing generators with p_nom set
+      * Extendable generators with p_nom=0, p_nom_max from profiles
+      * Storage units (battery, H2)
+      * Loads with time series
+
+===============================================================================
+CRITICAL CALCULATION: EXISTING POWER PLANT LOADING
+===============================================================================
+
+The load_and_aggregate_powerplants() function:
+
+1. Reads powerplants.csv with columns:
+   - Name, Country, Technology, Fueltype
+   - Capacity (MW), DateIn, DateOut
+   - bus (assigned during clustering)
+
+2. Carrier remapping:
+   "ocgt" → "OCGT"
+   "ccgt" → "CCGT"
+   "bioenergy" → "biomass"
+   "hard coal" → "coal"
+   "natural gas" → Technology column (OCGT/CCGT)
+   "hydro" → Technology (ror/PHS/hydro)
+
+3. Aggregation by (bus, carrier):
+   - Capacity: SUM
+   - Efficiency: capacity-weighted average
+   - Build year, lifetime calculated from DateIn/DateOut
+
+4. Efficiency classes (if enabled):
+   - Splits carrier into "low/medium/high efficiency"
+   - Based on 10th and 90th percentile of plant efficiencies
+
+⚠️ This creates EXISTING capacity that cannot expand.
+New capacity comes from extendable generators.
+
+===============================================================================
+CRITICAL CALCULATION: RENEWABLE GENERATOR CREATION
+===============================================================================
+
+Renewables are added with p_nom=0 (no existing) and p_nom_max from profiles.
+
+For each technology (solar, onwind, offwind-ac, offwind-dc):
+
+1. Load profile from profile_{technology}.nc
+2. For each (bus, bin) combination:
+   - Create Generator with:
+     * p_nom = 0 (no existing capacity in electricity-only mode)
+     * p_nom_max = from profile (technical potential)
+     * p_nom_extendable = True
+     * p_max_pu = hourly capacity factors from profile
+
+⚠️ In electricity-only mode, renewables start with ZERO capacity.
+Existing capacity is only added in sector-coupled mode via add_existing_baseyear.py
+
+===============================================================================
+CRITICAL CALCULATION: CAPITAL COST
+===============================================================================
+
+The calculate_annuity() function converts investment costs to annual payments:
+
+    annuity = r / (1 - 1/(1+r)^n)
+
+Where:
+    r = discount rate (e.g., 0.07 for 7%)
+    n = lifetime in years
+
+Then:
+    capital_cost = investment_cost × annuity
+
+This allows fair comparison between technologies with different lifetimes.
+
+===============================================================================
+CRITICAL CALCULATION: MARGINAL COST
+===============================================================================
+
+For conventional generators:
+
+    marginal_cost = VOM + fuel_cost / efficiency
+
+Where:
+    VOM = Variable Operations & Maintenance (€/MWh_el)
+    fuel_cost = Fuel price (€/MWh_th)
+    efficiency = Electrical conversion efficiency
+
+CO2 costs can be added later via prepare_network.py.
+
+===============================================================================
+CRITICAL CREATION: STORAGE
+===============================================================================
+
+Two storage modeling approaches:
+
+1. StorageUnit (simple):
+   - Single component with linked energy/power capacity
+   - e_nom = p_nom × max_hours
+   - One investment variable
+
+2. Store + Links (detailed):
+   - Separate store (energy) and links (charger/discharger)
+   - Three investment variables
+   - Allows different charge/discharge capacities
+
+===============================================================================
+COMPONENT SUMMARY
+===============================================================================
+
+After this script, the network contains:
+
+GENERATORS:
+- Conventional (CCGT, OCGT, coal, nuclear, etc.): p_nom_extendable=False
+- Renewables (solar, wind): p_nom=0, p_nom_extendable=True
+- New conventional (if in extendable_carriers): p_nom_extendable=True
+
+STORAGE:
+- Battery, H2: p_nom_extendable=True (if configured)
+
+LOADS:
+- Electricity demand: Fixed time series (not shiftable)
+
+TRANSMISSION:
+- Lines: AC transmission (s_nom from topology)
+- Links: DC transmission (p_nom from topology)
+
+===============================================================================
+INTERACTION WITH OTHER SCRIPTS
+===============================================================================
+
+This script:
+- RECEIVES: base network topology, power plant data, renewable profiles
+- PROVIDES: Complete electricity network to prepare_network.py
+
+For sector coupling:
+- prepare_sector_network.py builds on this for heat, transport, industry
+- add_existing_baseyear.py adds existing renewable capacity
+
+===============================================================================
+
 Description
 -----------
 

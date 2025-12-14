@@ -3,6 +3,225 @@
 # SPDX-License-Identifier: MIT
 """
 Prepares brownfield data from previous planning horizon.
+
+Script: add_brownfield.py
+Purpose: Transfer optimized capacity from one planning horizon to the next in
+         myopic optimization. This is the KEY script that enables multi-period
+         investment planning with path dependency.
+
+===============================================================================
+DATA FLOW OVERVIEW
+===============================================================================
+
+Input Files:
+    1. network (NetCDF): Fresh network for current planning horizon
+       - Built by prepare_sector_network.py for the new horizon
+       - Contains new investment options but NO previous capacity decisions
+       - Has updated technology costs for the new planning year
+
+    2. network_p (NetCDF): SOLVED network from PREVIOUS planning horizon
+       - Contains optimized capacity decisions (p_nom_opt, e_nom_opt)
+       - Has build_year and lifetime attributes set
+       - Example: If solving 2040, this is the solved 2030 network
+
+Output:
+    - Combined network with:
+      * Previous optimized capacity transferred as non-extendable
+      * New investment options available for optimization
+      * Grid expansion locked in from previous decisions
+      * Asset retirement based on lifetime constraints
+
+===============================================================================
+CRITICAL CALCULATION: CAPACITY TRANSFER
+===============================================================================
+
+The add_brownfield() function performs the key capacity transfer:
+
+    CORE LOGIC (lines 100-103):
+        c.df[f"{attr}_nom"] = c.df[f"{attr}_nom_opt"]  # Optimized → Fixed
+        c.df[f"{attr}_nom_extendable"] = False          # Lock it in
+
+    This means:
+    - p_nom_opt (optimized capacity) becomes p_nom (fixed capacity)
+    - Asset can no longer expand in future horizons
+    - Asset continues to operate until retirement
+
+    COMPONENT-SPECIFIC HANDLING:
+    - Generators: p_nom_opt → p_nom
+    - Links: p_nom_opt → p_nom
+    - Stores: e_nom_opt → e_nom (storage capacity)
+
+===============================================================================
+CRITICAL CALCULATION: ASSET RETIREMENT
+===============================================================================
+
+Assets are removed from future horizons based on lifetime:
+
+    RETIREMENT CHECK (line 70):
+        n_p.remove(c.name, c.df.index[c.df.build_year + c.df.lifetime <= year])
+
+    Example:
+    - Asset built in 2010 with 20-year lifetime
+    - In 2030 horizon: 2010 + 20 = 2030, so asset IS retired (<=)
+    - In 2025 horizon: 2010 + 20 = 2030 > 2025, so asset survives
+
+    ⚠️ KEY DETAIL: The <= means assets retire AT END of their final year
+    - A 2010 asset with 20-year life operates through 2029, not 2030
+
+===============================================================================
+CRITICAL CALCULATION: TRANSMISSION GRID EXPANSION
+===============================================================================
+
+Grid expansion is handled specially for lines and DC links:
+
+    LINES (line 58):
+        n.lines.s_nom_min = n_p.lines.s_nom_opt
+
+    DC LINKS (lines 59-60):
+        n.links.loc[dc_i, "p_nom_min"] = n_p.links.loc[dc_i, "p_nom_opt"]
+
+    This sets the MINIMUM capacity to the optimized value, meaning:
+    - Grid cannot contract (no decommissioning of transmission)
+    - Grid can further expand if transmission expansion is allowed
+    - Creates path-dependent transmission investment
+
+===============================================================================
+SPECIAL HANDLING: THRESHOLD FILTERING
+===============================================================================
+
+Small capacities are removed to improve solver performance (lines 92-98):
+
+    if p_nom_opt < capacity_threshold:
+        component is removed
+
+    EXCEPTION - CHP Heat Links:
+    CHP heat output is proportional to electric output via:
+        threshold_heat = threshold × efficiency_electric × p_nom_ratio / efficiency_heat
+
+    This ensures CHP electric and heat links are removed consistently.
+
+===============================================================================
+SPECIAL HANDLING: HYDROGEN PIPELINE RETROFIT
+===============================================================================
+
+For scenarios with H2 pipeline retrofitting (lines 114-156):
+
+1. Gas pipelines can be converted to H2 pipelines
+2. Already-retrofitted capacity is tracked across horizons
+3. Remaining gas pipeline capacity decreases as more is retrofitted
+
+    Formula:
+        remaining_H2_retrofit_potential = original_potential - already_retrofitted
+        remaining_gas_capacity = original_gas - CH4_per_H2 × already_retrofitted
+
+    Where CH4_per_H2 accounts for different volumetric capacity of H2 vs CH4.
+
+===============================================================================
+SPECIAL HANDLING: RENEWABLE PROFILE UPDATES
+===============================================================================
+
+The adjust_renewable_profiles() function updates capacity factors for:
+- Solar: May have degradation or technology improvement data by year
+- Wind: May have updated wind resource data by year
+
+    Selection logic (line 232-233):
+        closest_year = max(y for y in ds.year.values if y <= year)
+
+    Uses the most recent profile data available up to the planning year.
+
+===============================================================================
+SPECIAL HANDLING: HEAT PUMP EFFICIENCY UPDATES
+===============================================================================
+
+The update_heat_pump_efficiency() function (lines 246-293):
+
+Heat pumps from previous years receive CURRENT year COP values because:
+- Ambient temperatures may change (climate scenarios)
+- District heating supply temperatures may decrease over time
+- Ground source temperatures may be affected by widespread adoption
+
+This means 2030-vintage heat pumps in a 2050 network use 2050 COPs.
+
+===============================================================================
+TRANSMISSION EXPANSION LIMIT CHECK
+===============================================================================
+
+The disable_grid_expansion_if_limit_hit() function:
+
+If transmission expansion has reached its limit (from global constraints):
+1. Check if current minimum capacity ≈ expansion limit
+2. If limit reached:
+   - Set s_nom/p_nom = s_nom_min/p_nom_min (lock in capacity)
+   - Disable further expansion (extendable = False)
+   - Remove the now-redundant global constraint
+
+This prevents solver from wasting time on infeasible expansion.
+
+===============================================================================
+UNDERSTANDING THE MYOPIC WORKFLOW
+===============================================================================
+
+Complete myopic workflow for 2020→2030→2040:
+
+1. YEAR 2020 (Base Year):
+   - add_existing_baseyear.py: Add historical capacity
+   - solve_network.py: Optimize for 2020
+   - Output: solved_2020.nc with p_nom_opt set
+
+2. YEAR 2030:
+   - prepare_sector_network.py: Build fresh 2030 network
+   - add_brownfield.py: Merge solved_2020.nc into 2030 network
+     * 2020 optimized capacity → 2030 fixed capacity
+     * 2020 assets with lifetime ending ≤ 2030 are retired
+   - solve_network.py: Optimize for 2030
+   - Output: solved_2030.nc
+
+3. YEAR 2040:
+   - prepare_sector_network.py: Build fresh 2040 network
+   - add_brownfield.py: Merge solved_2030.nc into 2040 network
+     * 2020 and 2030 assets transferred (if not retired)
+     * 2020 assets may now retire (build_year + lifetime ≤ 2040)
+   - solve_network.py: Optimize for 2040
+
+===============================================================================
+DEBUGGING GUIDE
+===============================================================================
+
+Common Issue: "Asset disappeared between horizons"
+Cause: build_year + lifetime <= current_year (retirement)
+Check: Compare asset lifetime with planning horizon gap
+Fix: Extend lifetime in costs.csv if unrealistic
+
+Common Issue: "Capacity too high in future year"
+Cause: Small capacities not being filtered
+Check: capacity_threshold in config
+Fix: Adjust threshold or investigate why small assets persist
+
+Common Issue: "Grid expansion not working"
+Cause: Expansion limit already reached
+Check: Logs for "Transmission expansion ... already reached"
+Fix: Increase expansion limit or accept constraint
+
+Common Issue: "CHP mismatch between horizons"
+Cause: Electric/heat links filtered inconsistently
+Check: Compare CHP electric and heat Link indices
+Fix: Verify p_nom_ratio and efficiency values
+
+===============================================================================
+USE CASE CONSIDERATIONS
+===============================================================================
+
+This script is designed for:
+✓ Myopic multi-period capacity expansion modeling
+✓ Path-dependent investment decisions
+✓ Asset lifetime tracking and retirement
+
+This script assumes:
+- Previous network was successfully solved (has *_nom_opt values)
+- Component naming is consistent between horizons
+- Time series indices are compatible
+
+===============================================================================
 """
 
 import logging
@@ -37,20 +256,121 @@ def add_brownfield(
     """
     Add brownfield capacity from previous network.
 
+    This is the CORE function for myopic optimization. It transfers optimized
+    capacity decisions from the previous planning horizon to the current one,
+    handling asset retirement, capacity locking, and infrastructure constraints.
+
     Parameters
     ----------
     n : pypsa.Network
-        Network to add brownfield to
+        Fresh network for current planning year (to be modified in-place)
+        - Has new investment options with p_nom_extendable=True
+        - Has updated costs for the planning year
+        - Does NOT have previous capacity decisions
+
     n_p : pypsa.Network
-        Previous network to get brownfield from
+        SOLVED network from PREVIOUS planning horizon
+        - Has p_nom_opt/e_nom_opt from optimization
+        - Has build_year and lifetime for all assets
+        - Will be modified during processing (components removed)
+
     year : int
-        Planning year
-    h2_retrofit : bool
-        Whether to allow hydrogen pipeline retrofitting
-    h2_retrofit_capacity_per_ch4 : float
-        Ratio of hydrogen to methane capacity for pipeline retrofitting
-    capacity_threshold : float
-        Threshold for removing assets with low capacity
+        Current planning year (e.g., 2030, 2040)
+        Used for lifetime calculations and asset retirement
+
+    h2_retrofit : bool, default False
+        Whether hydrogen pipeline retrofitting is enabled
+        If True: Gas pipeline capacity is reduced as H2 pipelines are built
+
+    h2_retrofit_capacity_per_ch4 : float, optional
+        Volumetric ratio of H2 to CH4 capacity in retrofitted pipelines
+        Typical value: ~0.8-0.9 (H2 has lower volumetric energy density)
+        Only used if h2_retrofit=True
+
+    capacity_threshold : float, optional
+        Minimum capacity (MW) to retain. Assets with p_nom_opt below this
+        threshold are removed to improve solver performance.
+        Typical value: 0.1 to 10 MW depending on model resolution
+
+    Calculation Details
+    -------------------
+
+    1. TRANSMISSION GRID (Lines 57-60):
+       The previous optimized transmission becomes the MINIMUM for future.
+
+       n.lines.s_nom_min = n_p.lines.s_nom_opt
+
+       This ensures:
+       - No grid contraction (cannot decommission transmission)
+       - Further expansion possible up to s_nom_max
+
+    2. ASSET FILTERING (Lines 62-98):
+       Three categories of assets are removed from n_p before transfer:
+
+       a) Infinite-lifetime assets (line 67):
+          - CO2 tracking, EU-wide aggregators
+          - These already exist in fresh network n
+
+       b) Retired assets (line 70):
+          - build_year + lifetime <= year
+          - Asset has reached end of life
+
+       c) Small-capacity assets (lines 72-98):
+          - p_nom_opt < capacity_threshold
+          - Exception: CHP links use adjusted threshold
+
+    3. CAPACITY TRANSFER (Lines 100-103):
+       For each surviving Link/Generator/Store:
+
+       c.df["p_nom"] = c.df["p_nom_opt"]     # Lock in optimized capacity
+       c.df["p_nom_extendable"] = False      # No further expansion
+
+       For Stores: uses e_nom and e_nom_opt instead.
+
+    4. TIME SERIES TRANSFER (Lines 106-112):
+       All time-dependent inputs are copied:
+       - p_max_pu, p_min_pu for generators
+       - efficiency time series for links
+       - inflow for storage units
+
+    5. H2 RETROFIT HANDLING (Lines 114-156):
+       If h2_retrofit=True:
+
+       a) Calculate already-retrofitted H2 pipeline capacity
+       b) Reduce remaining retrofit potential:
+          remaining = original_potential - already_retrofitted
+
+       c) Reduce gas pipeline capacity proportionally:
+          gas_remaining = original_gas - CH4_per_H2 × already_retrofitted
+
+       Where CH4_per_H2 = 1 / h2_retrofit_capacity_per_ch4
+
+    Example Walkthrough
+    -------------------
+    Previous horizon (2030) solved with:
+    - Generator "DE1 solar-2030": p_nom_opt = 5000 MW
+    - Link "DE1 CCGT-2010": p_nom_opt = 1000 MW, lifetime = 30 years
+
+    Current horizon (2040):
+    - Solar asset: Transferred with p_nom = 5000 MW, p_nom_extendable = False
+    - CCGT asset: build_year + lifetime = 2010 + 30 = 2040 → RETIRED (<=2040)
+
+    Debugging Tips
+    --------------
+    To trace capacity flow between horizons:
+    1. Check n_p.generators.p_nom_opt before add_brownfield
+    2. After call: Check n.generators.p_nom for transferred values
+    3. Missing assets: Check lifetime constraint or threshold filtering
+
+    To debug retirement:
+    - Log: n_p.generators[["build_year", "lifetime"]]
+    - Calculate: build_year + lifetime vs current year
+    - Assets where sum <= year will be removed
+
+    See Also
+    --------
+    add_existing_baseyear.py : Sets initial build_year and lifetime
+    solve_network.py : Produces p_nom_opt values
     """
     logger.info(f"Preparing brownfield for the year {year}")
 

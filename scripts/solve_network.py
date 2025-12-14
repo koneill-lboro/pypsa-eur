@@ -8,12 +8,269 @@ iteratively optimize while updating line reactances.
 This script is used for optimizing the electrical network as well as the
 sector coupled network.
 
+Script: solve_network.py
+Purpose: Execute the optimization of the PyPSA network, applying additional
+         constraints for capacity limits, land use, CO2, and other policies.
+
+===============================================================================
+DATA FLOW OVERVIEW
+===============================================================================
+
+Input Files:
+    1. network (NetCDF): Prepared network from prepare_sector_network.py or
+       add_brownfield.py containing:
+       - Buses, generators, links, stores, storage_units
+       - Time series (loads, renewable profiles)
+       - Cost assumptions (marginal_cost, capital_cost)
+       - Extendability flags (p_nom_extendable, e_nom_extendable)
+
+    2. Config parameters:
+       - Solver settings (solver name, options)
+       - Constraint options (CCL, BAU, SAFE, EQ)
+       - CO2 sequestration limits
+
+Output:
+    1. Solved network (NetCDF) with:
+       - Optimized capacities (*_nom_opt)
+       - Dispatch results (p, e in time series)
+       - Shadow prices (duals if requested)
+
+    2. Config YAML: Full configuration used for solving
+
+===============================================================================
+OPTIMIZATION FORMULATION
+===============================================================================
+
+The optimization minimizes TOTAL ANNUAL SYSTEM COST:
+
+    min Σ(capital_cost × p_nom + marginal_cost × p × weight)
+
+Subject to:
+    1. Power balance at each bus and time step
+    2. Capacity limits (p ≤ p_nom × p_max_pu)
+    3. Ramping constraints (if enabled)
+    4. Storage cycling constraints
+    5. Global constraints (CO2, land use, etc.)
+    6. Custom constraints added in extra_functionality()
+
+The optimization is performed using PyPSA's optimize() function with the
+linopy library for model building and various solvers (Gurobi, CPLEX, etc.).
+
+===============================================================================
+CRITICAL CONSTRAINTS: LAND USE
+===============================================================================
+
+Two land use constraint implementations depending on foresight type:
+
+1. MYOPIC (add_land_use_constraint):
+   For each renewable technology and node:
+       p_nom[new] ≤ p_nom_max - p_nom[existing]
+
+   This subtracts existing capacity from the technical potential.
+
+   ⚠️ CRITICAL CHECK (lines 176-186):
+   If p_nom_min > p_nom_max (existing exceeds potential):
+   - Logs WARNING
+   - Adjusts p_nom_max upward
+
+2. PERFECT FORESIGHT (add_land_use_constraint_perfect):
+   More complex: Creates per-bus constraints across all investment periods
+   to ensure total installed capacity never exceeds potential.
+
+===============================================================================
+CRITICAL CONSTRAINTS: CO2 SEQUESTRATION
+===============================================================================
+
+The add_co2_sequestration_limit() function (lines 249-289):
+
+Limits total CO2 that can be stored underground per year.
+
+    Constraint: Σ(CO2 stored) ≤ limit × years_represented
+
+    Where limit comes from:
+    - config['sector']['co2_sequestration_potential']
+    - Values in MtCO2/year per country or globally
+
+===============================================================================
+CRITICAL CONSTRAINTS: CCL (Country Carrier Limits)
+===============================================================================
+
+The add_CCL_constraints() function (lines 530-639):
+
+Enforces minimum and/or maximum capacity by (country, carrier) pairs.
+
+    Data source: agg_p_nom_limits file (e.g., data/agg_p_nom_minmax.csv)
+
+    Constraint format:
+        min_MW ≤ Σ(p_nom[country, carrier]) ≤ max_MW
+
+    Options:
+    - agg_offwind: Combine all offshore wind types
+    - agg_solar: Combine all solar types
+    - include_existing: Subtract existing capacity from limits
+
+    ⚠️ This is the primary mechanism for enforcing national capacity targets
+    like FES scenarios in UK modeling.
+
+===============================================================================
+CRITICAL CONSTRAINTS: EQ (Equity)
+===============================================================================
+
+The add_EQ_constraints() function (lines 642-705):
+
+Requires each region to generate a minimum share of its consumption.
+
+    Formula: generation[region] ≥ level × load[region]
+
+    Where level is extracted from opts string (e.g., "EQ0.7" = 70%)
+
+    Use cases:
+    - Preventing over-reliance on imports
+    - Modeling self-sufficiency requirements
+
+===============================================================================
+CRITICAL CONSTRAINTS: SAFE (Reserve Margin)
+===============================================================================
+
+The add_SAFE_constraints() function (lines 731-764):
+
+Ensures sufficient dispatchable capacity above peak demand.
+
+    Constraint: Σ(conventional_p_nom) ≥ peak_demand × (1 + margin)
+
+    Where margin comes from config['electricity']['SAFE_reservemargin']
+
+    ⚠️ Only conventional carriers counted; renewables excluded due to variability.
+
+===============================================================================
+CRITICAL CONSTRAINTS: CHP Coupling
+===============================================================================
+
+The add_chp_constraints() function (lines 1010-1061):
+
+Enforces combined heat and power operational constraints:
+
+1. Fixed power-to-heat ratio:
+   p_nom[electric] × ratio × η_e = p_nom[heat] × η_h
+
+2. Top isofuel line:
+   p[electric] + p[heat] ≤ p_nom[electric]
+
+3. Back-pressure constraint:
+   p[heat] × η_h × c_b ≤ p[electric] × η_e
+
+These ensure CHP units operate within their feasible region.
+
+===============================================================================
+CRITICAL CONSTRAINTS: Battery Sizing
+===============================================================================
+
+The add_battery_constraints() function (lines 973-993):
+
+Enforces charger = discharger × efficiency for battery storage.
+
+    Constraint: p_nom[charger] = p_nom[discharger] × η
+
+    This ensures batteries can charge/discharge at rated power
+    accounting for round-trip efficiency.
+
+===============================================================================
+CRITICAL CONSTRAINTS: TES (Thermal Energy Storage)
+===============================================================================
+
+Two TES constraints (lines 846-970):
+
+1. Energy-to-power ratio:
+   e_nom[storage] = energy_to_power_ratio × p_nom[charger]
+
+2. Charger ratio:
+   p_nom[charger] = η_discharger × p_nom[discharger]
+
+===============================================================================
+SOLVER WORKFLOW
+===============================================================================
+
+The solve_network() function (lines 1273-1395):
+
+1. PREPARATION:
+   - Set solver options from config
+   - Configure transmission losses if enabled
+   - Set up logging
+
+2. SOLVING:
+   Three paths depending on configuration:
+
+   a) Rolling horizon (for operations):
+      Solves in chunks with overlap
+
+   b) Skip iterations (no line expansion):
+      Single n.optimize() call
+
+   c) Iterative (with line expansion):
+      n.optimize.optimize_transmission_expansion_iteratively()
+      Updates line reactances between iterations
+
+3. POST-PROCESSING:
+   - Check for infeasibility (logs and raises)
+   - Verify objective value if check_objective enabled
+   - Export to NetCDF
+
+===============================================================================
+EXTRA FUNCTIONALITY
+===============================================================================
+
+The extra_functionality() function (lines 1165-1242) is the MAIN HOOK for
+adding custom constraints. It calls all the constraint functions based on
+config settings.
+
+Order of constraint addition:
+1. BAU constraints (if enabled)
+2. SAFE constraints (if enabled)
+3. CCL constraints (if enabled)
+4. Operational reserve margin (if enabled)
+5. EQ constraints (if enabled)
+6. Solar potential constraints (for multiple solar types)
+7. TES constraints
+8. Battery constraints
+9. Bidirectional link constraints
+10. Pipe retrofit constraint
+11. Carbon constraints (multi-invest) or CO2 atmosphere (single period)
+12. Geothermal constraints
+13. Import limit
+14. Custom user constraints (if configured)
+
+===============================================================================
+DEBUGGING GUIDE
+===============================================================================
+
+Issue: "Solving status 'infeasible'"
+- Check n.model.compute_infeasibilities() output
+- Common causes:
+  * CO2 limit too strict
+  * Not enough capacity potential for demand
+  * Conflicting CCL constraints
+
+Issue: "Objective value differs from expected"
+- Check objective_check settings
+- Compare with previous runs
+- May indicate solver numerical issues
+
+Issue: "Memory usage too high"
+- Enable rolling_horizon for operations
+- Reduce temporal resolution
+- Check logging_frequency setting
+
+Issue: "Solver timeout"
+- Adjust solver options (MIPGap, TimeLimit)
+- Simplify network (fewer nodes, carriers)
+
+===============================================================================
+
 Description
 -----------
 
 Total annual system costs are minimised with PyPSA. The full formulation of the
-linear optimal power flow (plus investment planning
-is provided in the
+linear optimal power flow (plus investment planning) is provided in the
 `documentation of PyPSA <https://pypsa.readthedocs.io/en/latest/optimal_power_flow.html#linear-optimal-power-flow>`_.
 
 The optimization is based on the :func:`network.optimize` function.

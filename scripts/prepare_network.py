@@ -15,6 +15,162 @@ as.
 - reducing the **temporal** resolution by averaging over multiple hours
   or segmenting time series into chunks of varying lengths using ``tsam``.
 
+Script: prepare_network.py
+Purpose: Apply scenario-specific modifications to the electricity network before
+         solving, including CO2 limits, emission prices, transmission constraints,
+         and temporal resolution adjustments.
+
+===============================================================================
+DATA FLOW OVERVIEW
+===============================================================================
+
+Input Files:
+    1. network (NetCDF): Network from add_electricity.py
+       - Contains generators, loads, lines, links
+       - Has full temporal resolution (hourly)
+
+    2. costs.csv: Technology cost assumptions
+       - For transmission expansion costs
+
+    3. co2_price.csv (optional): Time-varying CO2 prices
+
+Output:
+    - Modified network with:
+      * Global constraints (CO2 limit, transmission limits)
+      * Adjusted temporal resolution
+      * Transmission expansion enabled/disabled
+      * Emission prices in marginal costs
+
+===============================================================================
+CRITICAL MODIFICATION: CO2 LIMIT
+===============================================================================
+
+The add_co2limit() function (lines 94-101):
+
+    n.add("GlobalConstraint", "CO2Limit",
+          carrier_attribute="co2_emissions",
+          sense="<=",
+          constant=co2limit * Nyears)
+
+This creates a CONSTRAINT on total CO2 emissions:
+    Σ(generation × emission_factor) ≤ co2limit × years
+
+WHERE:
+- co2limit: Annual limit in tonnes/year (from config)
+- Nyears: Number of years represented by snapshots
+- emission_factor: From carrier.co2_emissions
+
+⚠️ This is the primary mechanism for CO2 reduction scenarios.
+
+===============================================================================
+CRITICAL MODIFICATION: EMISSION PRICES
+===============================================================================
+
+The add_emission_prices() function (lines 117-128):
+
+Adds CO2 cost to generator marginal costs:
+
+    gen_marginal_cost += (co2_price × co2_emissions / efficiency)
+
+This internalizes carbon costs into dispatch decisions.
+
+For dynamic prices, add_dynamic_emission_prices() uses time-varying CO2 price:
+    - Reads from co2_price.csv
+    - Creates time-dependent marginal_cost in generators_t
+
+===============================================================================
+CRITICAL MODIFICATION: TRANSMISSION EXPANSION
+===============================================================================
+
+The set_transmission_limit() function (lines 153-191):
+
+Controls how much transmission can be expanded:
+
+1. Set minimum capacity (brownfield constraint):
+   n.lines["s_nom_min"] = existing_capacity
+   n.lines["s_nom_extendable"] = True
+
+2. Add global constraint (if factor != "opt"):
+   - kind="c": Cost-based limit (total capital cost)
+   - kind="v": Volume-based limit (total MW-km)
+
+   Constraint: Σ(expansion × cost_or_length) ≤ factor × reference
+
+WHERE:
+- factor: Expansion multiplier (e.g., 1.5 = 50% more than today)
+- reference: Today's transmission value
+
+===============================================================================
+CRITICAL MODIFICATION: TEMPORAL RESOLUTION
+===============================================================================
+
+Two methods for reducing temporal resolution:
+
+1. average_every_nhours() (lines 194-211):
+   Simple averaging over time windows.
+
+   Example: "3h" averages every 3 hours → 8760/3 = 2920 snapshots
+
+   ⚠️ Warning: Averaging smooths peaks, affecting reliability calculations.
+
+2. apply_time_segmentation() (lines 214-259):
+   Uses tsam library for intelligent time series aggregation.
+
+   Benefits:
+   - Preserves temporal structure better than averaging
+   - Keeps representative extreme hours
+   - Configurable number of segments
+
+===============================================================================
+CRITICAL MODIFICATION: N-1 SECURITY MARGIN
+===============================================================================
+
+The set_line_s_max_pu() function (lines 148-150):
+
+Sets transmission line capacity derating for N-1 security:
+
+    n.lines["s_max_pu"] = 0.7  (default)
+
+This means lines can only use 70% of their rated capacity,
+accounting for contingency (failure of another line).
+
+===============================================================================
+CRITICAL MODIFICATION: AUTARKY
+===============================================================================
+
+The enforce_autarky() function (lines 262-274):
+
+Removes cross-border transmission to enforce self-sufficiency:
+
+- only_crossborder=True: Removes only cross-border lines
+- only_crossborder=False: Removes ALL transmission
+
+Use case: Modeling isolated systems or extreme scenarios.
+
+===============================================================================
+CRITICAL MODIFICATION: COST/POTENTIAL ADJUSTMENTS
+===============================================================================
+
+The maybe_adjust_costs_and_potentials() function (lines 87-91):
+
+Applies scenario-specific adjustments to technology parameters:
+
+1. "factor" mode: Multiply existing values
+   Example: capital_cost × 0.8 (20% cost reduction)
+
+2. "absolute" mode: Replace with new values
+   Example: efficiency = 0.65
+
+Used for sensitivity analysis and scenario variations.
+
+===============================================================================
+USE IN WORKFLOW
+===============================================================================
+
+This script runs AFTER add_electricity.py and BEFORE solve_network.py.
+
+For sector-coupled models, similar modifications are in prepare_sector_network.py.
+
 Description
 -----------
 

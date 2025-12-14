@@ -4,6 +4,170 @@
 """
 Adds existing power and heat generation capacities for initial planning
 horizon.
+
+Script: add_existing_baseyear.py
+Purpose: Initialize the base year network with historical/existing capacity for
+         myopic optimization scenarios. This script is CRITICAL for brownfield
+         modeling as it establishes the starting point for capacity expansion.
+
+===============================================================================
+DATA FLOW OVERVIEW
+===============================================================================
+
+Input Files:
+    1. network (NetCDF): Pre-built sector network from prepare_sector_network.py
+       - Contains topology, buses, and new investment options
+       - Generators have p_nom_max (technical potential) but no existing capacity
+
+    2. powerplants.csv: Power plant database (from powerplantmatching/OPSD)
+       - Columns: Name, Fueltype, Technology, Capacity, DateIn, DateOut, Country, bus
+       - Source: Open Power System Data + manual additions
+       - Contains individual plant-level data for conventional generators
+
+    3. costs.csv: Technology cost assumptions
+       - Contains lifetime, efficiency, capital_cost for each technology
+       - Used to calculate remaining lifetime of existing assets
+
+    4. cop_profiles.nc: Heat pump coefficient of performance time series
+       - Spatially and temporally varying COP values
+       - Used for existing heat pump efficiency
+
+    5. existing_heating_distribution.csv: Existing heating technology mix
+       - Columns: (heat_system, technology) × nodes
+       - Source: Derived from national heating statistics
+       - Contains thermal capacity (MW_th) per technology per node
+
+    6. heating_efficiencies.csv: Country-specific boiler efficiencies
+       - Used to convert thermal capacity to fuel input capacity (p_nom)
+
+Output:
+    - Modified network (NetCDF) with existing capacities added as:
+      * Generators with p_nom set (for renewables)
+      * Links with p_nom set (for conventional plants and heating)
+      * Build years assigned for lifetime tracking
+
+===============================================================================
+CRITICAL CALCULATION: RENEWABLE CAPACITY DISTRIBUTION
+===============================================================================
+
+The add_existing_renewables() function distributes NATIONAL renewable capacity
+across NODES using a CAPACITY-FACTOR-WEIGHTED approach:
+
+    Formula: zone_capacity[zone] = national_total × (p_nom_max[zone] / Σ p_nom_max)
+
+    Where:
+    - national_total: Total installed capacity from IRENA database (MW)
+    - p_nom_max[zone]: Technical potential at zone (from land availability)
+
+    DATA SOURCE for national_total:
+    - IRENA STAT database via powerplantmatching library
+    - Aggregated by country and year (yearly capacity additions since 2000)
+
+    ⚠️ CRITICAL ASSUMPTION:
+    This distributes capacity proportional to GENERATION POTENTIAL, not actual
+    historical installation patterns. This means:
+    - High-resource zones get more capacity than low-resource zones
+    - Actual spatial distribution may differ significantly from model
+    - May cause p_nom > p_nom_max in zones with historically high deployment
+
+    WHY THIS APPROACH:
+    - Actual sub-national installation data often unavailable
+    - PyPSA-Eur is designed for scenario analysis, not historical validation
+    - Simplifies data requirements for multi-country studies
+
+    ALTERNATIVE APPROACH (for historical validation):
+    - Use actual zonal capacity from grid registries (e.g., REPD for UK)
+    - Modify existing_capacities data source in config
+
+===============================================================================
+CRITICAL CALCULATION: CONVENTIONAL POWER PLANT MAPPING
+===============================================================================
+
+The add_power_capacities_installed_before_baseyear() function:
+
+1. Loads individual power plants from powerplants.csv
+2. Groups by (grouping_year, Fueltype, bus) with capacity aggregated
+3. Creates network components with appropriate build_year for lifetime tracking
+
+    Grouping Years Logic:
+    - Plants grouped into discrete vintage years (e.g., [1980, 1985, 1990, ...])
+    - Remaining lifetime = DateOut - grouping_year + 1
+    - Allows tracking of asset retirement through planning horizons
+
+    ⚠️ KEY BEHAVIORS:
+    - Plants with DateOut < baseyear are excluded (already retired)
+    - Plants with DateIn > max(grouping_years) are dropped with WARNING
+    - Lifetime is aggregated as MEAN within each group
+
+    VALIDATION CHECK (lines 414-425):
+    If p_nom_min > p_nom_max (existing exceeds potential):
+    - WARNING is logged
+    - p_nom_max is adjusted upward to accommodate existing capacity
+    This can occur when:
+    - Technical potential calculations are conservative
+    - Historical spatial data differs from model distribution
+
+===============================================================================
+CRITICAL CALCULATION: HEATING CAPACITY INSTALLATION
+===============================================================================
+
+The add_heating_capacities_installed_before_baseyear() function:
+
+    Installation Timeline Assumption:
+    - Existing heating capacity assumed to be installed LINEARLY over time
+    - Distributed across grouping_years based on interval duration
+    - ratio = years_in_interval / total_years
+
+    Formula: capacity_in_year[y] = total_existing × (interval_years / sum(interval_years))
+
+    ⚠️ ASSUMPTIONS:
+    - Linear historical installation rate (not exponential growth)
+    - All heating types installed at same rate
+    - Uniform age distribution within intervals
+
+    Capacity Conversion:
+    - Input is THERMAL capacity (MW_th)
+    - Stored as FUEL INPUT capacity (p_nom = MW_th / efficiency)
+    - This is standard PyPSA convention for Links
+
+===============================================================================
+USE CASE LIMITATIONS
+===============================================================================
+
+This script is designed for:
+✓ Myopic optimization with brownfield constraints
+✓ Scenario analysis with approximate historical starting point
+✓ Multi-country European studies
+
+This script may NOT be suitable for:
+✗ Exact historical validation against zonal data
+✗ Studies requiring precise spatial distribution of existing capacity
+✗ Detailed plant-level dispatch modeling
+
+For strict historical validation, consider:
+- Replacing renewable distribution with actual zonal data
+- Adding plant-level constraints if specific plants are critical
+
+===============================================================================
+DEBUGGING GUIDE
+===============================================================================
+
+Common Issue: "Base year capacity exceeds technical potential"
+Cause: add_existing_renewables distributes more to zone than p_nom_max allows
+Check: Compare IRENA national total vs. sum of p_nom_max across zones
+Fix: Either increase p_nom_max or use alternative capacity data source
+
+Common Issue: "Missing power plants"
+Cause: DateIn > max(grouping_years)
+Check: Warning in logs about dropped assets
+Fix: Extend grouping_years_power in config
+
+Common Issue: "Heating capacity mismatch"
+Cause: Efficiency conversion or missing nodes
+Check: existing_heating_distribution.csv node names vs network buses
+Fix: Ensure node naming consistency
+
+===============================================================================
 """
 
 import logging
@@ -74,23 +238,87 @@ def add_existing_renewables(
     """
     Add existing renewable capacities to conventional power plant data.
 
+    This function distributes NATIONAL renewable capacity across NETWORK NODES
+    using a proportional allocation based on technical potential (p_nom_max).
+
     Parameters
     ----------
     df_agg : pd.DataFrame
-        DataFrame containing conventional power plant data
+        DataFrame containing conventional power plant data, modified in-place
+        to include renewable capacity entries
     costs : pd.DataFrame
         Technology cost data with 'lifetime' column indexed by technology
     n : pypsa.Network
         Network containing topology and generator data
     countries : list
-        List of country codes to consider
-    renewable_carriers: list
-        List of renewable carriers in the network
+        List of country codes (ISO 2-letter) to consider
+    renewable_carriers : list
+        List of renewable carriers in the network (e.g., ['solar', 'onwind', 'offwind-ac'])
 
     Returns
     -------
     None
-        Modifies df_agg in-place
+        Modifies df_agg in-place by adding rows for renewable generators
+
+    Data Flow
+    ---------
+    1. IRENA Data Retrieval (lines 161-166):
+       - Source: powerplantmatching.data.IRENASTAT()
+       - Returns: Historical capacity by (Technology, Country, Year)
+       - Unit: MW
+       - Coverage: Annual data from 2000 onwards
+
+    2. Technology Mapping:
+       tech_map = {"solar": "PV", "onwind": "Onshore", "offwind-ac": "Offshore"}
+       - Maps PyPSA carrier names to IRENA technology categories
+       - IRENA uses partial string matching (e.g., "PV" matches "Solar photovoltaic")
+
+    3. Yearly Capacity Calculation (lines 177-180):
+       - Takes cumulative capacity and computes YEARLY ADDITIONS
+       - df.diff(axis=1) gives new installations each year
+       - .clip(lower=0) handles any data anomalies (capacity shouldn't decrease)
+
+    4. Spatial Distribution (lines 182-191):
+       Formula: zone_cap = national_total × (p_nom_max[zone] / Σ p_nom_max)
+
+       Where fraction is computed as:
+           fraction = group.p_nom_max / group.p_nom_max.sum()
+
+       The cartesian() function creates (year × zone) matrix of capacities.
+
+    Critical Assumptions
+    --------------------
+    1. POTENTIAL-BASED DISTRIBUTION:
+       - Capacity allocated proportional to technical potential (p_nom_max)
+       - NOT based on actual historical installation locations
+       - High-CF zones get proportionally more capacity
+
+    2. UNIFORM COUNTRY DISTRIBUTION:
+       - All zones in a country share the same national total
+       - No sub-national allocation data used
+
+    3. IRENA DATA ACCURACY:
+       - Assumes IRENA national totals are accurate
+       - Any data gaps filled with zeros
+
+    Example Calculation
+    -------------------
+    For Germany (DE) with 50 GW solar in 2020:
+    - Zone DE1: p_nom_max = 10 GW → gets 10/100 × 50 = 5 GW
+    - Zone DE2: p_nom_max = 30 GW → gets 30/100 × 50 = 15 GW
+    - Zone DE3: p_nom_max = 60 GW → gets 60/100 × 50 = 30 GW
+    (where total potential = 100 GW)
+
+    Known Limitations
+    -----------------
+    - May allocate more capacity to a zone than actually installed there
+    - Offshore wind only uses "Offshore" category (no AC/DC split in IRENA)
+    - Solar-rooftop not separately tracked (included in PV)
+
+    See Also
+    --------
+    build_renewable_profiles.py : Generates p_nom_max from land availability
+    powerplantmatching : Library providing IRENA data access
     """
     tech_map = {"solar": "PV", "onwind": "Onshore", "offwind-ac": "Offshore"}
 
@@ -160,26 +388,124 @@ def add_power_capacities_installed_before_baseyear(
     """
     Add power generation capacities installed before base year.
 
+    This function processes the power plant database to add existing conventional
+    and renewable generators/links to the network. It is the primary function for
+    initializing brownfield capacity in myopic optimization.
+
     Parameters
     ----------
     n : pypsa.Network
-        Network to modify
+        Network to modify (in-place)
     costs : pd.DataFrame
-        Technology costs
+        Technology costs indexed by technology name, with columns:
+        'lifetime', 'efficiency', 'capital_cost', 'VOM', 'CO2 intensity'
     grouping_years : list
-        Intervals to group existing capacities
+        Discrete years for grouping plant vintages, e.g., [1980, 1990, 2000, 2010, 2020]
+        Plants are assigned to the nearest grouping year <= DateIn
     baseyear : int
-        Base year for analysis
+        Base year for analysis (e.g., 2020, 2030). Plants with DateOut < baseyear excluded
     powerplants_file : str
-        Path to powerplants CSV file
+        Path to powerplants CSV file (from build_powerplants rule)
     countries : list
-        List of countries to consider
+        List of ISO 2-letter country codes to include
     capacity_threshold : float
-        Minimum capacity threshold
+        Minimum capacity (MW) to include. Smaller plants are dropped.
     lifetime_values : dict
-        Default values for missing data
-    renewable_carriers: list
-        List of renewable carriers in the network
+        Default values for missing data, must contain 'lifetime' key
+    renewable_carriers : list
+        List of renewable carriers to process (e.g., ['solar', 'onwind', 'offwind-ac'])
+
+    Data Flow
+    ---------
+    1. Load Power Plant Database:
+       - Source: powerplants.csv (from build_powerplants.py using powerplantmatching)
+       - Original sources: OPSD, GEO, ENTSOE, national registries
+
+    2. Fuel Type Processing:
+       Conventional fuels are remapped:
+           "Hard Coal" → "coal"
+           "Lignite" → "lignite"
+           "Nuclear" → "nuclear"
+           "Oil" → "oil"
+           "OCGT" → "OCGT"
+           "CCGT" → "CCGT"
+           "Natural Gas" → Technology column (OCGT or CCGT)
+           "Bioenergy" → "urban central solid biomass CHP"
+
+       Dropped fuel types (handled separately or excluded):
+           Hydro, Wind, Solar, Geothermal, Waste, Other
+
+    3. Year Grouping Logic:
+       - Each plant assigned to grouping_year = max(gy for gy in grouping_years if gy <= DateIn)
+       - Remaining lifetime = DateOut - grouping_year + 1
+       - This allows cohort-based retirement tracking across planning horizons
+
+    4. Renewable Capacity Addition:
+       - Calls add_existing_renewables() to distribute IRENA national totals
+       - Creates synthetic plants for each (year, zone) combination
+
+    5. Network Component Creation:
+       - RENEWABLES: Added as Generators with build_year set
+       - CONVENTIONAL: Added as Links (fuel bus → electricity bus → CO2 bus)
+         * p_nom = capacity / efficiency (fuel input, not electrical output)
+         * efficiency = electrical conversion efficiency
+         * efficiency2 = CO2 intensity of fuel
+
+    Grouping Year Example
+    ---------------------
+    With grouping_years = [1980, 1990, 2000, 2010, 2020]:
+    - Plant built in 1985 → grouping_year = 1980
+    - Plant built in 2003 → grouping_year = 2000
+    - Plant built in 2022 → DROPPED (> max grouping year) with WARNING
+
+    Capacity Aggregation
+    --------------------
+    Plants are aggregated by (grouping_year, Fueltype, bus):
+    - Capacity: SUM
+    - Lifetime: MEAN (across plants in same group)
+
+    This simplifies the network while maintaining age-based retirement.
+
+    Validation Check
+    ----------------
+    After adding renewables, the function checks if p_nom_min > p_nom_max.
+    If existing capacity exceeds technical potential:
+    - Logs WARNING with affected generators
+    - Adjusts p_nom_max upward to accommodate existing capacity
+
+    This is a CRITICAL check for debugging capacity distribution issues.
+
+    Component Types Created
+    -----------------------
+    1. Renewables (Generator):
+       - Carriers: solar, onwind, offwind-ac
+       - Has build_year, lifetime from costs
+       - Attached to bus (AC node)
+
+    2. Fossil Fuels (Link):
+       - Carriers: coal, lignite, nuclear, oil, OCGT, CCGT
+       - bus0 = fuel bus (e.g., "EU coal")
+       - bus1 = AC node
+       - bus2 = "co2 atmosphere"
+       - p_nom = capacity / efficiency (fuel input)
+
+    3. Biomass CHP (Link):
+       - bus0 = biomass bus
+       - bus1 = AC node
+       - bus2 = urban central heat bus (if district heating exists)
+
+    Known Issues
+    ------------
+    1. Plants with DateIn > max(grouping_years) are silently dropped
+       → Check logs for "newer_assets" warning
+    2. Offshore wind uses generic "Offshore" category from IRENA
+       → No distinction between AC and DC connection
+    3. Mean lifetime aggregation may not represent actual plant distribution
+
+    See Also
+    --------
+    add_brownfield.py : Uses build_year/lifetime for inter-horizon transfers
+    build_powerplants.py : Creates the input powerplants.csv
     """
     logger.debug(f"Adding power capacities installed before {baseyear}")
 
@@ -493,34 +819,142 @@ def add_heating_capacities_installed_before_baseyear(
     """
     Add heating capacities installed before base year.
 
+    This function initializes the heating sector with existing capacity for heat pumps,
+    resistive heaters, gas/oil/biomass boilers distributed across heat system types.
+
     Parameters
     ----------
     n : pypsa.Network
-        Network to modify
+        Network to modify (in-place)
     costs : pd.DataFrame
-        Technology costs
+        Technology costs indexed by technology name
     baseyear : int
-        Base year for analysis
+        Base year for analysis (e.g., 2020)
     grouping_years : list
-        Intervals to group capacities
+        Discrete years for grouping heating system vintages
+        Example: [1980, 1990, 2000, 2010, 2020]
+    existing_capacities : pd.DataFrame
+        Existing heating capacity distribution with:
+        - Index: node names (e.g., "DE1 0", "FR2 0")
+        - Columns: MultiIndex of (heat_system, technology)
+        - Values: Thermal capacity in MW_th
+        - Heat systems: "urban central", "urban decentral", "rural"
+        - Technologies: "air heat pump", "ground heat pump", "gas boiler", etc.
     heat_pump_cop : xr.DataArray
         Heat pump coefficients of performance
-    use_time_dependent_cop : bool
-        Use time-dependent COPs
-    heating_default_lifetime : int
-        Default lifetime for heating systems
-    existing_capacities : pd.DataFrame
-        Existing heating capacity distribution
+        - Dimensions: (time, heat_system, heat_source, name)
+        - Values: COP ranging typically from 2.0 to 5.0
     heat_pump_source_types : dict
-        Heat pump sources by system type
+        Heat pump sources by system type, e.g.:
+        {"central": ["air"], "decentral": ["air", "ground"]}
     efficiency_file : str
-        Path to heating efficiencies file
+        Path to heating_efficiencies.csv with country-specific boiler efficiencies
+    use_time_dependent_cop : bool
+        If True: Use hourly COP profiles (temperature-dependent)
+        If False: Use fixed average COP from costs database
+    default_lifetime : int
+        Default lifetime for heating systems in years (e.g., 25)
     energy_totals_year : int
-        Year for energy totals
+        Year for efficiency data lookup (e.g., 2019)
     capacity_threshold : float
-        Minimum capacity threshold
+        Minimum capacity (MW) to include in network
     use_electricity_distribution_grid : bool
-        Whether to use electricity distribution grid
+        If True: Heat pumps connect to "low voltage" buses
+        If False: Heat pumps connect directly to main buses
+
+    Data Flow
+    ---------
+    1. Existing Capacity Source:
+       - File: existing_heating_distribution.csv
+       - Built by: build_existing_heating_distribution.py
+       - Original data: Eurostat, national heating surveys
+
+    2. Installation Timeline Assumption:
+       Existing capacity is assumed to be installed LINEARLY over time,
+       distributed across grouping_years proportional to interval duration.
+
+       Formula:
+           ratio[year] = interval_years[year] / total_covered_years
+
+       Example with grouping_years = [1990, 2000, 2010] and baseyear = 2020:
+       - 1990 interval: 1990 to 1999 = 10 years
+       - 2000 interval: 2000 to 2009 = 10 years
+       - 2010 interval: 2010 to 2019 = 10 years
+       - Total = 30 years
+       - Each interval gets 1/3 of capacity
+
+    3. Capacity Conversion (Thermal to Fuel Input):
+       PyPSA Links store p_nom as FUEL INPUT, not thermal output.
+
+       For boilers: p_nom = thermal_capacity / boiler_efficiency
+       For heat pumps: Uses COP-adjusted efficiency
+
+    4. Heat System Types:
+       - "urban central": District heating networks
+       - "urban decentral": Individual heating in urban areas
+       - "rural": Individual heating in rural areas
+
+    Technologies Added
+    ------------------
+    1. Heat Pumps (Link):
+       - Carriers: "{heat_system} {source} heat pump"
+       - bus0: heat bus (output)
+       - bus1: electricity bus (input, note: reversed from typical Link)
+       - efficiency: 1/COP (heat input per electricity)
+       - p_max_pu: 0 (cannot export heat to electricity)
+       - p_min_pu: -efficiency (can consume electricity to produce heat)
+
+    2. Resistive Heaters (Link):
+       - Carrier: "{heat_system} resistive heater"
+       - efficiency: ~0.99 (near-perfect conversion)
+       - Simple electric heating without COP benefit
+
+    3. Gas Boilers (Link):
+       - bus0: gas bus ("EU gas" or node-specific)
+       - bus1: heat bus
+       - bus2: "co2 atmosphere" (for emissions tracking)
+       - efficiency: Country-specific from efficiency_file
+
+    4. Oil Boilers (Link):
+       - Similar structure to gas boilers
+       - bus0: oil bus
+
+    5. Biomass Boilers (Link):
+       - bus0: biomass bus
+       - Only added if capacity > 0 in existing_capacities
+
+    Efficiency Handling
+    -------------------
+    Efficiencies come from two sources:
+    1. Costs database (costs.csv): Default technology efficiencies
+    2. Country-specific (heating_efficiencies.csv): Regional variations
+
+    For residential/services: Uses country-specific efficiency
+    For urban central: Uses costs database efficiency
+
+    Cleanup Operations
+    ------------------
+    After adding all components, the function removes:
+    - Links with p_nom = NaN (missing nodes)
+    - Links with p_nom < capacity_threshold (negligible capacity)
+
+    Known Assumptions
+    -----------------
+    1. Linear historical installation rate (not exponential growth)
+    2. All heating technologies assumed to have same age distribution
+    3. No differentiation between heat pump vintages (all get current COP)
+    4. Building stock changes not modeled (existing capacity stays in same locations)
+
+    Debugging Tips
+    --------------
+    - Check existing_capacities.csv for correct node names
+    - Verify heat system types match network bus carriers
+    - NaN in p_nom usually indicates missing bus/node mismatch
+
+    See Also
+    --------
+    build_existing_heating_distribution.py : Creates existing_capacities input
+    prepare_sector_network.py : Creates heat buses and initial network structure
     """
     logger.debug(f"Adding heating capacities installed before {baseyear}")
 
